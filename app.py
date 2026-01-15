@@ -203,7 +203,7 @@ def get_col_letter(col_idx):
         string = chr(65 + remainder) + string
     return string
 
-def update_cell(row, row_idx, col_idx, value, val_type):
+def update_cell(row, row_idx, col_idx, value, val_type, clear_style=False):
     """Update or create a cell in the row"""
     col_letter = get_col_letter(col_idx)
     cell_ref = f"{col_letter}{row_idx}"
@@ -218,6 +218,10 @@ def update_cell(row, row_idx, col_idx, value, val_type):
     if cell is None:
         cell = ET.Element(f"{{{NS['x']}}}c", {'r': cell_ref})
         row.append(cell)
+    
+    # Clear style if requested (forces default alignment, usually left for text)
+    if clear_style and 's' in cell.attrib:
+        del cell.attrib['s']
     
     # Clear children
     for child in list(cell):
@@ -287,7 +291,8 @@ def populate_excel(data, template_path, mapping, excel_headers):
             
             # Check if this is the description column and uppercase it
             col_name = next((name for idx, name in excel_headers if idx == excel_col_idx), "")
-            if "description" in col_name.lower():
+            is_description = "description" in col_name.lower()
+            if is_description:
                 final_val = final_val.upper()
             
             # Determine type
@@ -299,12 +304,11 @@ def populate_excel(data, template_path, mapping, excel_headers):
             val_type = 'str'
             num_val = clean_number(final_val)
             
-            # Check if it looks like a number (and not empty)
             if final_val and re.match(r'^-?\d+(\.\d+)?$', final_val.replace(',', '.')):
                  final_val = num_val
                  val_type = 'num'
             
-            update_cell(row, row_idx, excel_col_idx, final_val, val_type)
+            update_cell(row, row_idx, excel_col_idx, final_val, val_type, clear_style=is_description)
         
     temp_zip = output_path + ".tmp"
     with zipfile.ZipFile(template_path, 'r') as zin:
