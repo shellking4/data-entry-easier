@@ -10,6 +10,8 @@ from io import BytesIO
 import pandas as pd
 import tempfile
 import ocr_utils
+from openpyxl.styles import Alignment
+from copy import copy
 
 # Namespaces
 NS = {'x': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
@@ -203,7 +205,7 @@ def get_col_letter(col_idx):
         string = chr(65 + remainder) + string
     return string
 
-def update_cell(row, row_idx, col_idx, value, val_type, clear_style=False):
+def update_cell(row, row_idx, col_idx, value, val_type):
     """Update or create a cell in the row"""
     col_letter = get_col_letter(col_idx)
     cell_ref = f"{col_letter}{row_idx}"
@@ -218,10 +220,6 @@ def update_cell(row, row_idx, col_idx, value, val_type, clear_style=False):
     if cell is None:
         cell = ET.Element(f"{{{NS['x']}}}c", {'r': cell_ref})
         row.append(cell)
-    
-    # Clear style if requested (forces default alignment, usually left for text)
-    if clear_style and 's' in cell.attrib:
-        del cell.attrib['s']
     
     # Clear children
     for child in list(cell):
@@ -308,7 +306,7 @@ def populate_excel(data, template_path, mapping, excel_headers):
                  final_val = num_val
                  val_type = 'num'
             
-            update_cell(row, row_idx, excel_col_idx, final_val, val_type, clear_style=is_description)
+            update_cell(row, row_idx, excel_col_idx, final_val, val_type)
         
     temp_zip = output_path + ".tmp"
     with zipfile.ZipFile(template_path, 'r') as zin:
@@ -320,6 +318,38 @@ def populate_excel(data, template_path, mapping, excel_headers):
                     zout.writestr(item, zin.read(item.filename))
     
     shutil.move(temp_zip, output_path)
+    
+    # Post-process with openpyxl to fix alignment
+    # This preserves borders (from the template style) but overrides alignment
+    try:
+        wb = openpyxl.load_workbook(output_path)
+        if len(wb.sheetnames) > 1:
+            ws = wb[wb.sheetnames[1]]
+        else:
+            ws = wb.active
+            
+        # Find description column index
+        desc_col_idx = -1
+        for idx, name in excel_headers:
+            if "description" in name.lower():
+                desc_col_idx = idx
+                break
+        
+        if desc_col_idx != -1:
+            for i in range(len(data)):
+                row_idx = start_row + i
+                cell = ws.cell(row=row_idx, column=desc_col_idx)
+                # Apply left alignment
+                if cell.alignment:
+                    new_align = copy(cell.alignment)
+                    new_align.horizontal = 'left'
+                    cell.alignment = new_align
+                else:
+                    cell.alignment = Alignment(horizontal='left')
+        
+        wb.save(output_path)
+    except Exception as e:
+        st.warning(f"Could not update alignment: {e}")
     
     with open(output_path, 'rb') as f:
         output = BytesIO(f.read())
