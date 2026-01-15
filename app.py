@@ -115,10 +115,27 @@ def extract_pdf_data(pdf_file, selected_pdf_headers):
                     # Map column names to indices
                     global_col_indices = {h: i for i, h in enumerate(headers)}
                     
+                    # Identify number column for filtering
+                    no_col_idx = -1
+                    for h, idx in global_col_indices.items():
+                        if h.lower() in ['no', 'no.', 'item', '#', 'n°', 'pos']:
+                            no_col_idx = idx
+                            break
+                    
                     # Process rows after header
                     for row in table[header_row_idx+1:]:
                         if not row or all(cell is None or cell == "" for cell in row):
                             continue
+                        
+                        # Filter by number column if it exists
+                        if no_col_idx != -1 and no_col_idx < len(row):
+                            val = row[no_col_idx]
+                            # Check if value is numeric (allow digits, maybe ending with dot)
+                            if not val:
+                                continue
+                            val_str = str(val).strip()
+                            if not val_str or not val_str.replace('.', '').isdigit():
+                                continue
                             
                         row_data = {}
                         for h, idx in global_col_indices.items():
@@ -131,9 +148,26 @@ def extract_pdf_data(pdf_file, selected_pdf_headers):
                 # If no headers found, but we have a global mapping, assume continuation
                 elif global_col_indices is not None:
                     # We assume the table structure is similar (continuation)
+                    
+                    # Re-identify number column from global mapping (indices are same)
+                    no_col_idx = -1
+                    for h, idx in global_col_indices.items():
+                        if h.lower() in ['no', 'no.', 'item', '#', 'n°', 'pos']:
+                            no_col_idx = idx
+                            break
+
                     for row in table:
                         if not row or all(cell is None or cell == "" for cell in row):
                             continue
+                            
+                        # Filter by number column if it exists
+                        if no_col_idx != -1 and no_col_idx < len(row):
+                            val = row[no_col_idx]
+                            if not val:
+                                continue
+                            val_str = str(val).strip()
+                            if not val_str or not val_str.replace('.', '').isdigit():
+                                continue
                             
                         row_data = {}
                         for h, idx in global_col_indices.items():
