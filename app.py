@@ -236,9 +236,10 @@ def update_cell(row, row_idx, col_idx, value, val_type):
         v_elem = ET.SubElement(cell, f"{{{NS['x']}}}v")
         v_elem.text = str(value)
 
-def populate_excel(data, template_path, mapping):
+def populate_excel(data, template_path, mapping, excel_headers):
     """Populate Excel file using direct XML patching
     mapping: dict {excel_col_idx: [pdf_col_names]}
+    excel_headers: list of (col_idx, col_name) tuples
     """
     
     # Create a temp file for the output
@@ -283,6 +284,11 @@ def populate_excel(data, template_path, mapping):
                     parts.append(str(val).strip())
             
             final_val = " ".join(parts)
+            
+            # Check if this is the description column and uppercase it
+            col_name = next((name for idx, name in excel_headers if idx == excel_col_idx), "")
+            if "description" in col_name.lower():
+                final_val = final_val.upper()
             
             # Determine type
             # Heuristic: if column name implies number, try to clean
@@ -423,7 +429,7 @@ def main():
                         st.success(f"Extracted {len(data)} items from {file_type.upper()}.")
                         
                         if data:
-                            processed_excel = populate_excel(data, template_path, mapping)
+                            processed_excel = populate_excel(data, template_path, mapping, excel_headers)
                             
                             st.subheader("Preview of Data to be Written")
                             
