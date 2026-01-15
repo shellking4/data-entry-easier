@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from io import BytesIO
 import pandas as pd
 import tempfile
+import ocr_utils
 
 # Namespaces
 NS = {'x': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
@@ -44,6 +45,42 @@ def get_pdf_headers(pdf_file):
                         return [str(cell).strip() if cell else f"Col_{i}" for i, cell in enumerate(row)]
     return []
 
+def get_input_excel_headers(excel_file):
+    """Extract headers from the uploaded Excel file"""
+    try:
+        df = pd.read_excel(excel_file)
+        # Convert to string and strip
+        return [str(c).strip() for c in df.columns]
+    except Exception as e:
+        st.error(f"Error reading Excel file: {e}")
+        return []
+
+def extract_input_excel_data(excel_file, selected_headers):
+    """Extract data from Excel file"""
+    try:
+        df = pd.read_excel(excel_file)
+        
+        # Filter columns
+        # We need to map selected headers to actual columns
+        # But selected_headers ARE the actual columns (or close to it)
+        
+        data = []
+        for _, row in df.iterrows():
+            row_data = {}
+            for h in selected_headers:
+                if h in df.columns:
+                    val = row[h]
+                    if pd.notna(val):
+                        row_data[h] = val
+            
+            if row_data:
+                data.append(row_data)
+                
+        return data
+    except Exception as e:
+        st.error(f"Error extracting data from Excel: {e}")
+        return []
+
 def extract_pdf_data(pdf_file, selected_pdf_headers):
     """Extract data from PDF file object"""
     data = []
@@ -53,6 +90,9 @@ def extract_pdf_data(pdf_file, selected_pdf_headers):
     if not selected_pdf_headers:
         return []
 
+    # Store the column mapping once found to use for subsequent pages
+    global_col_indices = None
+    
     with pdfplumber.open(pdf_file) as pdf:
         for i, page in enumerate(pdf.pages):
             tables = page.extract_tables()
@@ -61,34 +101,45 @@ def extract_pdf_data(pdf_file, selected_pdf_headers):
                 header_row_idx = -1
                 headers = []
                 
-                # Find header row
+                # Try to find header row in this table
                 for idx, row in enumerate(table):
                     row_values = [str(cell).strip() for cell in row if cell]
-                    # Check if at least one selected header is present
-                    # (Making it lenient: if ANY selected header is found, assume it's the table)
-                    # Or better: check if a significant subset is found?
-                    # Let's check for the first selected header found.
                     matches = sum(1 for h in selected_pdf_headers if h in row_values)
                     if matches > 0:
                         header_row_idx = idx
                         headers = [str(cell).strip() if cell else f"Col_{c_i}" for c_i, cell in enumerate(row)]
                         break
                 
+                # If headers found, update global mapping
                 if header_row_idx != -1:
                     # Map column names to indices
-                    col_indices = {h: i for i, h in enumerate(headers)}
+                    global_col_indices = {h: i for i, h in enumerate(headers)}
                     
+                    # Process rows after header
                     for row in table[header_row_idx+1:]:
                         if not row or all(cell is None or cell == "" for cell in row):
                             continue
                             
                         row_data = {}
-                        # Extract all columns
-                        for h, idx in col_indices.items():
+                        for h, idx in global_col_indices.items():
                             if idx < len(row):
                                 row_data[h] = row[idx]
                         
-                        # Only add if we have some data
+                        if any(row_data.values()):
+                            data.append(row_data)
+                            
+                # If no headers found, but we have a global mapping, assume continuation
+                elif global_col_indices is not None:
+                    # We assume the table structure is similar (continuation)
+                    for row in table:
+                        if not row or all(cell is None or cell == "" for cell in row):
+                            continue
+                            
+                        row_data = {}
+                        for h, idx in global_col_indices.items():
+                            if idx < len(row):
+                                row_data[h] = row[idx]
+                        
                         if any(row_data.values()):
                             data.append(row_data)
     
@@ -247,18 +298,53 @@ def main():
         st.error(f"Template file '{template_path}' not found in the directory!")
         return
     
-    pdf_file = st.file_uploader("Upload PDF Invoice", type="pdf")
+    uploaded_file = st.file_uploader("Upload Invoice (PDF or Excel)", type=["pdf", "xlsx"])
         
-    if pdf_file:
-        pdf_headers = get_pdf_headers(pdf_file)
+    if uploaded_file:
+        file_type = uploaded_file.name.split('.')[-1].lower()
+        
+        input_headers = []
+        processing_file_path = None
+        is_pdf = False
+        
+        if file_type == 'pdf':
+            is_pdf = True
+            # Save uploaded file to temp file for processing
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_pdf:
+                tmp_pdf.write(uploaded_file.getvalue())
+                tmp_pdf_path = tmp_pdf.name
+                
+            try:
+                # Check if OCR is needed
+                if ocr_utils.needs_ocr(tmp_pdf_path):
+                    st.warning("Scanned document detected. Performing OCR (this may take a while)...")
+                    with st.spinner("Running OCR..."):
+                        # Convert to searchable PDF
+                        searchable_pdf_path = ocr_utils.convert_to_searchable_pdf(tmp_pdf_path)
+                        # Use the new PDF for processing
+                        processing_file_path = searchable_pdf_path
+                else:
+                    processing_file_path = tmp_pdf_path
+
+                input_headers = get_pdf_headers(processing_file_path)
+            except Exception as e:
+                st.error(f"Error processing PDF: {e}")
+                
+        elif file_type == 'xlsx':
+            input_headers = get_input_excel_headers(uploaded_file)
+            # For Excel, we can just use the uploaded_file object directly with pandas, 
+            # but for consistency we might want to just pass it.
+            # However, extract_input_excel_data takes the file object.
+            pass
+            
         excel_headers = get_excel_headers(template_path)
         
-        if pdf_headers and excel_headers:
+        if input_headers and excel_headers:
             st.subheader("Column Mapping")
-            st.info("Map the PDF columns to the Excel fields. You can select multiple PDF columns to combine them into one Excel field.")
+            st.info(f"Map the {file_type.upper()} columns to the Excel fields.")
             
             mapping = {}
-            selected_pdf_headers = set()
+            selected_input_headers = set()
             
             # Create 3 columns for layout
             cols = st.columns(3)
@@ -269,7 +355,7 @@ def main():
                     default = []
                     col_name_lower = col_name.lower()
                     
-                    for ph in pdf_headers:
+                    for ph in input_headers:
                         ph_lower = ph.lower()
                         # Heuristics for defaults
                         if "description" in col_name_lower and ("model" in ph_lower or "material" in ph_lower):
@@ -281,19 +367,26 @@ def main():
                     
                     selection = st.multiselect(
                         f"{col_name}",
-                        options=pdf_headers,
+                        options=input_headers,
                         default=default,
                         key=f"map_{col_idx}"
                     )
                     mapping[col_idx] = selection
-                    selected_pdf_headers.update(selection)
+                    selected_input_headers.update(selection)
             
             if st.button("Process File", type="primary"):
                 with st.spinner("Processing..."):
                     try:
-                        # Extract data
-                        data = extract_pdf_data(pdf_file, list(selected_pdf_headers))
-                        st.success(f"Extracted {len(data)} items from PDF.")
+                        data = []
+                        if is_pdf:
+                            data = extract_pdf_data(processing_file_path, list(selected_input_headers))
+                        else:
+                            # Excel
+                            # Reset pointer to beginning of file if it was read before
+                            uploaded_file.seek(0)
+                            data = extract_input_excel_data(uploaded_file, list(selected_input_headers))
+                            
+                        st.success(f"Extracted {len(data)} items from {file_type.upper()}.")
                         
                         if data:
                             processed_excel = populate_excel(data, template_path, mapping)
@@ -307,14 +400,14 @@ def main():
                             
                             for item in data:
                                 row_data = {}
-                                for col_idx, pdf_cols in mapping.items():
-                                    if not pdf_cols:
+                                for col_idx, input_cols in mapping.items():
+                                    if not input_cols:
                                         continue
                                     
                                     # Replicate the concatenation logic
                                     parts = []
-                                    for pdf_col in pdf_cols:
-                                        val = item.get(pdf_col)
+                                    for input_col in input_cols:
+                                        val = item.get(input_col)
                                         if val:
                                             parts.append(str(val).strip())
                                     
@@ -337,18 +430,25 @@ def main():
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                             )
                         else:
-                            st.warning("No data found in the PDF matching the selected columns.")
+                            st.warning(f"No data found in the {file_type.upper()} matching the selected columns.")
                             
                     except Exception as e:
                         st.error(f"An error occurred: {str(e)}")
         else:
-            if not pdf_headers:
-                st.warning("Could not detect headers in the PDF.")
+            if not input_headers:
+                st.warning(f"Could not detect headers in the {file_type.upper()}.")
             if not excel_headers:
                 st.error("Could not read headers from Excel template.")
+        
+        # Cleanup
+        if is_pdf:
+            if 'tmp_pdf_path' in locals() and os.path.exists(tmp_pdf_path):
+                os.unlink(tmp_pdf_path)
+            if 'processing_file_path' in locals() and processing_file_path != tmp_pdf_path and os.path.exists(processing_file_path):
+                os.unlink(processing_file_path)
                     
-    elif not pdf_file:
-        st.info("Please upload a PDF file to start.")
+    elif not uploaded_file:
+        st.info("Please upload a PDF or Excel file to start.")
 
 if __name__ == "__main__":
     main()
