@@ -7,11 +7,12 @@ import shutil
 import os
 import xml.etree.ElementTree as ET
 from io import BytesIO
-import pandas as pd
 import tempfile
 import ocr_utils
-from openpyxl.styles import Alignment
-from copy import copy
+import shutil
+import zipfile
+import xml.etree.ElementTree as ET
+import re
 
 # Namespaces
 NS = {'x': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
@@ -238,6 +239,56 @@ def update_cell(row, row_idx, col_idx, value, val_type):
         v_elem = ET.SubElement(cell, f"{{{NS['x']}}}v")
         v_elem.text = str(value)
 
+def add_left_aligned_style(zip_ref, temp_zip_path, base_style_idx=221):
+    """
+    Reads styles.xml, duplicates the style at base_style_idx, 
+    changes alignment to left, adds it to cellXfs, and returns the new index.
+    """
+    new_idx = -1
+    
+    with zipfile.ZipFile(zip_ref, 'r') as zin:
+        xml_content = zin.read('xl/styles.xml')
+    
+    root = ET.fromstring(xml_content)
+    cellXfs = root.find(f"{{{NS['x']}}}cellXfs")
+    
+    if cellXfs is not None:
+        xfs = list(cellXfs.findall(f"{{{NS['x']}}}xf"))
+        if 0 <= base_style_idx < len(xfs):
+            # Create a deep copy of the element (by parsing its string representation)
+            base_xf = xfs[base_style_idx]
+            xf_str = ET.tostring(base_xf, encoding='unicode')
+            new_xf = ET.fromstring(xf_str)
+            
+            # Modify alignment
+            align = new_xf.find(f"{{{NS['x']}}}alignment")
+            if align is None:
+                align = ET.SubElement(new_xf, f"{{{NS['x']}}}alignment")
+            
+            align.set('horizontal', 'left')
+            
+            # Append to cellXfs
+            cellXfs.append(new_xf)
+            
+            # Update count
+            count = int(cellXfs.get('count', 0))
+            cellXfs.set('count', str(count + 1))
+            
+            new_idx = count # The index of the newly added item
+            
+            # Write back to temp zip
+            with zipfile.ZipFile(zip_ref, 'r') as zin:
+                with zipfile.ZipFile(temp_zip_path, 'w') as zout:
+                    for item in zin.infolist():
+                        if item.filename == 'xl/styles.xml':
+                            zout.writestr(item, ET.tostring(root, encoding='UTF-8', xml_declaration=True))
+                        else:
+                            zout.writestr(item, zin.read(item.filename))
+                            
+            return new_idx, True
+
+    return base_style_idx, False
+
 def populate_excel(data, template_path, mapping, excel_headers):
     """Populate Excel file using direct XML patching
     mapping: dict {excel_col_idx: [pdf_col_names]}
@@ -245,12 +296,17 @@ def populate_excel(data, template_path, mapping, excel_headers):
     """
     
     # Create a temp file for the output
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
-        output_path = tmp.name
+    output_path = tempfile.mktemp(suffix=".xlsx")
     
-    shutil.copy(template_path, output_path)
+    # First, patch styles.xml to add our left-aligned style
+    # We use a temp zip for this intermediate step
+    temp_style_zip = tempfile.mktemp(suffix=".xlsx")
+    left_align_style_idx, style_patched = add_left_aligned_style(template_path, temp_style_zip)
     
-    with zipfile.ZipFile(output_path, 'r') as zin:
+    # Use the patched zip as the source for the next step
+    source_zip = temp_style_zip if style_patched else template_path
+    
+    with zipfile.ZipFile(source_zip, 'r') as zin:
         sheet_xml = zin.read('xl/worksheets/sheet2.xml')
     
     root = ET.fromstring(sheet_xml)
@@ -307,9 +363,18 @@ def populate_excel(data, template_path, mapping, excel_headers):
                  val_type = 'num'
             
             update_cell(row, row_idx, excel_col_idx, final_val, val_type)
+            
+            # Apply left align style if description
+            if is_description and style_patched:
+                # Find the cell we just updated/created
+                col_letter = get_col_letter(excel_col_idx)
+                cell_ref = f"{col_letter}{row_idx}"
+                cell = next((c for c in row.findall(f"{{{NS['x']}}}c") if c.get('r') == cell_ref), None)
+                if cell is not None:
+                    cell.set('s', str(left_align_style_idx))
         
     temp_zip = output_path + ".tmp"
-    with zipfile.ZipFile(template_path, 'r') as zin:
+    with zipfile.ZipFile(source_zip, 'r') as zin:
         with zipfile.ZipFile(temp_zip, 'w') as zout:
             for item in zin.infolist():
                 if item.filename == 'xl/worksheets/sheet2.xml':
@@ -319,37 +384,9 @@ def populate_excel(data, template_path, mapping, excel_headers):
     
     shutil.move(temp_zip, output_path)
     
-    # Post-process with openpyxl to fix alignment
-    # This preserves borders (from the template style) but overrides alignment
-    try:
-        wb = openpyxl.load_workbook(output_path)
-        if len(wb.sheetnames) > 1:
-            ws = wb[wb.sheetnames[1]]
-        else:
-            ws = wb.active
-            
-        # Find description column index
-        desc_col_idx = -1
-        for idx, name in excel_headers:
-            if "description" in name.lower():
-                desc_col_idx = idx
-                break
-        
-        if desc_col_idx != -1:
-            for i in range(len(data)):
-                row_idx = start_row + i
-                cell = ws.cell(row=row_idx, column=desc_col_idx)
-                # Apply left alignment
-                if cell.alignment:
-                    new_align = copy(cell.alignment)
-                    new_align.horizontal = 'left'
-                    cell.alignment = new_align
-                else:
-                    cell.alignment = Alignment(horizontal='left')
-        
-        wb.save(output_path)
-    except Exception as e:
-        st.warning(f"Could not update alignment: {e}")
+    # Cleanup intermediate file
+    if style_patched and os.path.exists(temp_style_zip):
+        os.remove(temp_style_zip)
     
     with open(output_path, 'rb') as f:
         output = BytesIO(f.read())
