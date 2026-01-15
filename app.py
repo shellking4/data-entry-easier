@@ -8,11 +8,8 @@ import os
 import xml.etree.ElementTree as ET
 from io import BytesIO
 import tempfile
+import pandas as pd
 import ocr_utils
-import shutil
-import zipfile
-import xml.etree.ElementTree as ET
-import re
 
 # Namespaces
 NS = {'x': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
@@ -239,12 +236,22 @@ def update_cell(row, row_idx, col_idx, value, val_type):
         v_elem = ET.SubElement(cell, f"{{{NS['x']}}}v")
         v_elem.text = str(value)
 
-def add_left_aligned_style(zip_ref, temp_zip_path, base_style_idx=221):
+# Register namespaces to prevent ElementTree from mangling them (e.g. ns0:id instead of r:id)
+ET.register_namespace('', "http://schemas.openxmlformats.org/spreadsheetml/2006/main")
+ET.register_namespace('r', "http://schemas.openxmlformats.org/officeDocument/2006/relationships")
+ET.register_namespace('xdr', "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing")
+ET.register_namespace('mc', "http://schemas.openxmlformats.org/markup-compatibility/2006")
+ET.register_namespace('x14ac', "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac")
+
+def add_thin_border_styles(zip_ref, temp_zip_path, base_style_idx=221):
     """
-    Reads styles.xml, duplicates the style at base_style_idx, 
-    changes alignment to left, adds it to cellXfs, and returns the new index.
+    Reads styles.xml, creates two new styles based on base_style_idx:
+    1. Left-aligned, thin border (ID 5)
+    2. Center-aligned, thin border (ID 5)
+    Returns (left_idx, center_idx, success)
     """
-    new_idx = -1
+    left_idx = base_style_idx
+    center_idx = base_style_idx
     
     with zipfile.ZipFile(zip_ref, 'r') as zin:
         xml_content = zin.read('xl/styles.xml')
@@ -255,26 +262,36 @@ def add_left_aligned_style(zip_ref, temp_zip_path, base_style_idx=221):
     if cellXfs is not None:
         xfs = list(cellXfs.findall(f"{{{NS['x']}}}xf"))
         if 0 <= base_style_idx < len(xfs):
-            # Create a deep copy of the element (by parsing its string representation)
             base_xf = xfs[base_style_idx]
-            xf_str = ET.tostring(base_xf, encoding='unicode')
-            new_xf = ET.fromstring(xf_str)
             
-            # Modify alignment
-            align = new_xf.find(f"{{{NS['x']}}}alignment")
-            if align is None:
-                align = ET.SubElement(new_xf, f"{{{NS['x']}}}alignment")
+            # 1. Create Left-aligned style
+            left_xf = ET.fromstring(ET.tostring(base_xf, encoding='unicode'))
+            align_l = left_xf.find(f"{{{NS['x']}}}alignment")
+            if align_l is None:
+                align_l = ET.SubElement(left_xf, f"{{{NS['x']}}}alignment")
+            align_l.set('horizontal', 'left')
+            left_xf.set('borderId', '5')
+            left_xf.set('applyBorder', '1')
             
-            align.set('horizontal', 'left')
+            # 2. Create Center-aligned style
+            center_xf = ET.fromstring(ET.tostring(base_xf, encoding='unicode'))
+            align_c = center_xf.find(f"{{{NS['x']}}}alignment")
+            if align_c is None:
+                align_c = ET.SubElement(center_xf, f"{{{NS['x']}}}alignment")
+            align_c.set('horizontal', 'center')
+            center_xf.set('borderId', '5')
+            center_xf.set('applyBorder', '1')
             
-            # Append to cellXfs
-            cellXfs.append(new_xf)
+            # Append both
+            cellXfs.append(left_xf)
+            cellXfs.append(center_xf)
             
             # Update count
             count = int(cellXfs.get('count', 0))
-            cellXfs.set('count', str(count + 1))
+            cellXfs.set('count', str(count + 2))
             
-            new_idx = count # The index of the newly added item
+            left_idx = count
+            center_idx = count + 1
             
             # Write back to temp zip
             with zipfile.ZipFile(zip_ref, 'r') as zin:
@@ -285,9 +302,9 @@ def add_left_aligned_style(zip_ref, temp_zip_path, base_style_idx=221):
                         else:
                             zout.writestr(item, zin.read(item.filename))
                             
-            return new_idx, True
+            return left_idx, center_idx, True
 
-    return base_style_idx, False
+    return left_idx, center_idx, False
 
 def populate_excel(data, template_path, mapping, excel_headers):
     """Populate Excel file using direct XML patching
@@ -298,10 +315,10 @@ def populate_excel(data, template_path, mapping, excel_headers):
     # Create a temp file for the output
     output_path = tempfile.mktemp(suffix=".xlsx")
     
-    # First, patch styles.xml to add our left-aligned style
+    # First, patch styles.xml to add our thin-bordered styles
     # We use a temp zip for this intermediate step
     temp_style_zip = tempfile.mktemp(suffix=".xlsx")
-    left_align_style_idx, style_patched = add_left_aligned_style(template_path, temp_style_zip)
+    left_style_idx, center_style_idx, style_patched = add_thin_border_styles(template_path, temp_style_zip)
     
     # Use the patched zip as the source for the next step
     source_zip = temp_style_zip if style_patched else template_path
@@ -364,14 +381,17 @@ def populate_excel(data, template_path, mapping, excel_headers):
             
             update_cell(row, row_idx, excel_col_idx, final_val, val_type)
             
-            # Apply left align style if description
-            if is_description and style_patched:
+            # Apply thin border style
+            if style_patched:
                 # Find the cell we just updated/created
                 col_letter = get_col_letter(excel_col_idx)
                 cell_ref = f"{col_letter}{row_idx}"
                 cell = next((c for c in row.findall(f"{{{NS['x']}}}c") if c.get('r') == cell_ref), None)
                 if cell is not None:
-                    cell.set('s', str(left_align_style_idx))
+                    if is_description:
+                        cell.set('s', str(left_style_idx))
+                    else:
+                        cell.set('s', str(center_style_idx))
         
     temp_zip = output_path + ".tmp"
     with zipfile.ZipFile(source_zip, 'r') as zin:
